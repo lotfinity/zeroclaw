@@ -4742,6 +4742,11 @@ async fn process_channel_message_body(
             let _ = write!(system_prompt, "\n\n{peer_map}");
         }
     }
+    if let Some(visible_peer_mentions) =
+        render_visible_peer_mentions_for_message(ctx.as_ref(), &msg)
+    {
+        let _ = write!(system_prompt, "\n\n{visible_peer_mentions}");
+    }
     // NOTE: memory_context is intentionally NOT appended to the system prompt
     // here — it carries per-turn data that would invalidate the provider-side
     // prompt cache (#6360). The preamble below carries it into the outgoing
@@ -7195,6 +7200,75 @@ fn peer_prompt_channel_ref(
     } else {
         None
     }
+}
+
+fn render_visible_peer_mentions_for_message(
+    ctx: &ChannelRuntimeContext,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> Option<String> {
+    let current_channel_ref = peer_prompt_channel_ref(ctx, msg)?;
+    let resolved = zeroclaw_runtime::peers::resolve_peer_set(
+        ctx.prompt_config.as_ref(),
+        ctx.agent_alias.as_str(),
+    );
+
+    let mut peers: Vec<String> = Vec::new();
+    for (group_channel, agent_peers) in resolved.agent_peers {
+        if !channel_scope_matches(&current_channel_ref, &group_channel) {
+            continue;
+        }
+
+        for peer_alias in agent_peers {
+            let Some(peer_cfg) = ctx.prompt_config.agents.get(&peer_alias) else {
+                continue;
+            };
+            let mut handles: Vec<String> = peer_cfg
+                .channels
+                .iter()
+                .filter(|channel_ref| channel_scope_matches(&current_channel_ref, channel_ref))
+                .filter_map(|channel_ref| {
+                    ctx.channels_by_name
+                        .get(channel_ref.as_str())
+                        .and_then(|channel| channel.self_addressed_mention())
+                        .map(|mention| format!("{peer_alias}: {mention} via {channel_ref}"))
+                })
+                .collect();
+            handles.sort();
+            peers.extend(handles);
+        }
+    }
+
+    peers.sort();
+    peers.dedup();
+    if peers.is_empty() {
+        return None;
+    }
+
+    Some(format!(
+        "Visible peer mentions for this channel:\n- {}\n\
+         For group-visible coordination, address the target agent with the listed mention in this same chat/topic. \
+         Do not invent peer bot usernames; if a target has no listed mention, use an internal peer route only when private routing is intentional.",
+        peers.join("\n- ")
+    ))
+}
+
+fn channel_scope_matches(current_channel_ref: &str, candidate_channel_ref: &str) -> bool {
+    if current_channel_ref == candidate_channel_ref {
+        return true;
+    }
+
+    let current_base = current_channel_ref
+        .split_once('.')
+        .map(|(base, _)| base)
+        .unwrap_or(current_channel_ref);
+    let candidate_base = candidate_channel_ref
+        .split_once('.')
+        .map(|(base, _)| base)
+        .unwrap_or(candidate_channel_ref);
+
+    current_channel_ref == candidate_base
+        || candidate_channel_ref == current_base
+        || current_base == candidate_base
 }
 
 fn channel_ref_matches_message_channel(channel_ref: &str, message_channel: &str) -> bool {
@@ -13673,6 +13747,69 @@ BTC is currently around $65,000 based on latest tool output."#
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
         })
+    }
+
+    #[test]
+    fn visible_peer_mentions_include_alias_channel_handles_for_type_wide_group() {
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(
+            "telegram.explorer".to_string(),
+            mention_mock("telegram", "@ExplorerBot"),
+        );
+        channels_by_name.insert(
+            "telegram.builder".to_string(),
+            mention_mock("telegram", "@BuilderBot"),
+        );
+
+        let provider_impl = Arc::new(HistoryCaptureModelProvider::default());
+        let mut prompt_config = zeroclaw_config::schema::Config::default();
+        prompt_config.agents.insert(
+            "test-agent".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                channels: vec!["telegram.orchestrator".into()],
+                ..zeroclaw_config::schema::AliasedAgentConfig::default()
+            },
+        );
+        prompt_config.agents.insert(
+            "explorer".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                channels: vec!["telegram.explorer".into()],
+                ..zeroclaw_config::schema::AliasedAgentConfig::default()
+            },
+        );
+        prompt_config.agents.insert(
+            "builder".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                channels: vec!["telegram.builder".into()],
+                ..zeroclaw_config::schema::AliasedAgentConfig::default()
+            },
+        );
+        prompt_config.peer_groups.insert(
+            "telegram-team".to_string(),
+            zeroclaw_config::multi_agent::PeerGroupConfig {
+                channel: "telegram".into(),
+                agents: vec![
+                    zeroclaw_config::multi_agent::AgentAlias::new("test-agent"),
+                    zeroclaw_config::multi_agent::AgentAlias::new("explorer"),
+                    zeroclaw_config::multi_agent::AgentAlias::new("builder"),
+                ],
+                ..zeroclaw_config::multi_agent::PeerGroupConfig::default()
+            },
+        );
+
+        let ctx = peer_prompt_test_context(
+            channels_by_name,
+            provider_impl,
+            Arc::new(prompt_config),
+            Arc::new(Vec::new()),
+        );
+        let msg = channel_message("telegram", Some("orchestrator"));
+
+        let rendered = render_visible_peer_mentions_for_message(ctx.as_ref(), &msg)
+            .expect("peer mentions should render for aliased telegram peers");
+        assert!(rendered.contains("explorer: @ExplorerBot via telegram.explorer"));
+        assert!(rendered.contains("builder: @BuilderBot via telegram.builder"));
+        assert!(rendered.contains("Do not invent peer bot usernames"));
     }
 
     #[tokio::test]

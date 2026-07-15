@@ -1458,6 +1458,64 @@ impl TelegramChannel {
             .unwrap_or(false)
     }
 
+    fn is_from_bot(message: &serde_json::Value) -> bool {
+        message
+            .get("from")
+            .and_then(|from| from.get("is_bot"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    }
+
+    fn mentions_other_bot_without_self(text: &str, bot_username: &str) -> bool {
+        let own = bot_username.trim_start_matches('@');
+        let mut saw_other_bot = false;
+
+        for (at_idx, ch) in text.char_indices() {
+            if ch != '@' {
+                continue;
+            }
+            if at_idx > 0 {
+                let prev = text[..at_idx].chars().next_back().unwrap_or(' ');
+                if Self::is_telegram_username_char(prev) {
+                    continue;
+                }
+            }
+
+            let username_start = at_idx + 1;
+            let mut username_end = username_start;
+            for (rel_idx, candidate_ch) in text[username_start..].char_indices() {
+                if Self::is_telegram_username_char(candidate_ch) {
+                    username_end = username_start + rel_idx + candidate_ch.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            if username_end == username_start {
+                continue;
+            }
+
+            let mention = &text[username_start..username_end];
+            if mention.eq_ignore_ascii_case(own) {
+                return false;
+            }
+            if mention.to_ascii_lowercase().ends_with("bot") {
+                saw_other_bot = true;
+            }
+        }
+
+        saw_other_bot
+    }
+
+    fn is_explicit_bot_peer_route(&self, message: &serde_json::Value, text: &str) -> bool {
+        if !Self::is_from_bot(message) || !Self::is_group_message(message) {
+            return false;
+        }
+        let bot_username = self.bot_username.lock();
+        bot_username
+            .as_ref()
+            .is_some_and(|username| Self::contains_bot_mention(text, username))
+    }
+
     /// Check whether `message` is a reply to a message sent by the bot
     /// itself. When true, the `mention_only` gate should be bypassed.
     fn is_reply_to_bot(message: &serde_json::Value, bot_id: i64) -> bool {
@@ -1493,6 +1551,18 @@ impl TelegramChannel {
         caption: Option<&str>,
     ) -> Option<Option<String>> {
         let is_group = Self::is_group_message(message);
+        if Self::is_from_bot(message)
+            && !caption.is_some_and(|text| self.is_explicit_bot_peer_route(message, text))
+        {
+            return None;
+        }
+        if is_group
+            && let Some(caption) = caption
+            && let Some(bot_username) = self.bot_username.lock().as_ref()
+            && Self::mentions_other_bot_without_self(caption, bot_username)
+        {
+            return None;
+        }
         if !self.mention_only || !is_group {
             return Some(caption.map(String::from));
         }
@@ -1574,6 +1644,18 @@ impl TelegramChannel {
         let mut identities = vec![normalized_username.as_str()];
         if let Some(ref id) = normalized_sender_id {
             identities.push(id.as_str());
+        }
+
+        if Self::is_from_bot(message) {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                &format!(
+                    "silently ignoring Telegram bot sender: username={username}, sender_id={}",
+                    sender_id_str.as_deref().unwrap_or("unknown")
+                )
+            );
+            return;
         }
 
         if self.is_any_user_allowed(identities.iter().copied()) {
@@ -1836,7 +1918,12 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             identities.push(id);
         }
 
-        if !self.is_any_user_allowed(identities.iter().copied()) {
+        if !self.is_any_user_allowed(identities.iter().copied())
+            && !attachment
+                .caption
+                .as_deref()
+                .is_some_and(|caption| self.is_explicit_bot_peer_route(message, caption))
+        {
             return None;
         }
 
@@ -2017,7 +2104,12 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             identities.push(id);
         }
 
-        if !self.is_any_user_allowed(identities.iter().copied()) {
+        if !self.is_any_user_allowed(identities.iter().copied())
+            && !message
+                .get("caption")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|caption| self.is_explicit_bot_peer_route(message, caption))
+        {
             return None;
         }
 
@@ -2344,11 +2436,21 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             identities.push(id);
         }
 
-        if !self.is_any_user_allowed(identities.iter().copied()) {
+        if !self.is_any_user_allowed(identities.iter().copied())
+            && !self.is_explicit_bot_peer_route(message, text)
+        {
             return None;
         }
 
         let is_group = Self::is_group_message(message);
+        if is_group {
+            let bot_username = self.bot_username.lock();
+            if let Some(ref bot_username) = *bot_username
+                && Self::mentions_other_bot_without_self(text, bot_username)
+            {
+                return None;
+            }
+        }
         if self.mention_only && is_group {
             let bot_username = self.bot_username.lock();
             if let Some(ref bot_username) = *bot_username {
@@ -3705,9 +3807,7 @@ impl Channel for TelegramChannel {
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
         let mut offset: i64 = 0;
 
-        if self.mention_only {
-            let _ = self.get_bot_username().await;
-        }
+        let _ = self.get_bot_username().await;
 
         ::zeroclaw_log::record!(
             INFO,
@@ -5772,6 +5872,123 @@ mod tests {
             "mybot"
         ));
         assert!(!TelegramChannel::contains_bot_mention("", "mybot"));
+    }
+
+    #[test]
+    fn telegram_detects_bot_sender() {
+        let update = serde_json::json!({
+            "message": {
+                "from": { "id": 8962576161_i64, "username": "peer_bot", "is_bot": true }
+            }
+        });
+        assert!(TelegramChannel::is_from_bot(&update["message"]));
+    }
+
+    #[test]
+    fn telegram_other_bot_mention_without_self_is_detected() {
+        assert!(TelegramChannel::mentions_other_bot_without_self(
+            "@ExplorerBot please inspect this",
+            "OrchestratorBot"
+        ));
+        assert!(!TelegramChannel::mentions_other_bot_without_self(
+            "@OrchestratorBot please handle this",
+            "OrchestratorBot"
+        ));
+        assert!(!TelegramChannel::mentions_other_bot_without_self(
+            "ordinary unmentioned request",
+            "OrchestratorBot"
+        ));
+    }
+
+    #[test]
+    fn parse_update_message_drops_group_message_addressed_to_other_bot() {
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "orchestrator",
+            Arc::new(|| vec!["7735811297".into()]),
+            false,
+        );
+        *ch.bot_username.lock() = Some("OrchestratorBot".into());
+
+        let update = serde_json::json!({
+            "message": {
+                "message_id": 1,
+                "chat": { "id": -1001_i64, "type": "supergroup" },
+                "from": { "id": 7735811297_i64, "username": "operator", "is_bot": false },
+                "text": "@ExplorerBot inspect this"
+            }
+        });
+
+        assert!(ch.parse_update_message(&update).is_none());
+    }
+
+    #[test]
+    fn parse_update_message_allows_unmentioned_group_message_when_not_mention_only() {
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "orchestrator",
+            Arc::new(|| vec!["7735811297".into()]),
+            false,
+        );
+        *ch.bot_username.lock() = Some("OrchestratorBot".into());
+
+        let update = serde_json::json!({
+            "message": {
+                "message_id": 1,
+                "chat": { "id": -1001_i64, "type": "supergroup" },
+                "from": { "id": 7735811297_i64, "username": "operator", "is_bot": false },
+                "text": "ordinary unmentioned request"
+            }
+        });
+
+        assert!(ch.parse_update_message(&update).is_some());
+    }
+
+    #[test]
+    fn parse_update_message_allows_bot_sender_when_explicitly_mentioned() {
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "explorer",
+            Arc::new(|| vec!["7735811297".into()]),
+            true,
+        );
+        *ch.bot_username.lock() = Some("ExplorerBot".into());
+
+        let update = serde_json::json!({
+            "message": {
+                "message_id": 2,
+                "chat": { "id": -1001_i64, "type": "supergroup" },
+                "from": { "id": 111_i64, "username": "orchestrator_bot", "is_bot": true },
+                "text": "@ExplorerBot summarize this"
+            }
+        });
+
+        let parsed = ch
+            .parse_update_message(&update)
+            .expect("explicitly addressed bot peer message should route");
+        assert_eq!(parsed.sender, "orchestrator_bot");
+    }
+
+    #[test]
+    fn parse_update_message_drops_unaddressed_bot_sender() {
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "explorer",
+            Arc::new(|| vec!["7735811297".into()]),
+            false,
+        );
+        *ch.bot_username.lock() = Some("ExplorerBot".into());
+
+        let update = serde_json::json!({
+            "message": {
+                "message_id": 3,
+                "chat": { "id": -1001_i64, "type": "supergroup" },
+                "from": { "id": 111_i64, "username": "orchestrator_bot", "is_bot": true },
+                "text": "unaddressed bot chatter"
+            }
+        });
+
+        assert!(ch.parse_update_message(&update).is_none());
     }
 
     #[test]
